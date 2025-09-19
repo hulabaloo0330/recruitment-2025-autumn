@@ -1,0 +1,5 @@
+gmres
+obj/*
+*.out
+*.err
+gmres_time.txt
