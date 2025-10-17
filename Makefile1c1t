@@ -1,7 +1,9 @@
 CXX = g++
 
-CXX_CFLAGS = -w -std=c++14
-CXX_LDFLAGS =
+# 修改CXX_CFLAGS：添加-fopenmp，可以选择调整优化级别
+CXX_CFLAGS = -w -std=c++14 -O3 -march=native -fopenmp
+# 修改CXX_LDFLAGS：添加OpenMP链接选项
+CXX_LDFLAGS = -fopenmp
 
 # 目录
 DIR_OBJ = obj

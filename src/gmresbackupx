@@ -1,0 +1,290 @@
+#include <stdio.h>
+#include <assert.h>
+#include <iostream>
+#include <vector>
+#include <tuple>
+#include <cmath>
+#include <cassert>
+#include <chrono>
+// 包含 Intel Intrinsics 头文件以使用 AVX-512
+#include <immintrin.h>
+#include "sparseMatrix.hpp"
+#include "gmres.hpp"
+
+using namespace std;
+
+const int RESTART_TIMES = 20;         // 禁止修改
+const double REL_RESID_LIMIT = 1e-6;  // 禁止修改
+const int ITERATION_LIMIT = 10000;    // 禁止修改
+
+// 缓存优化: H 矩阵现在按列主序存储.
+// H[row][col] -> H[col * num_rows + row]
+const int H_NUM_ROWS = RESTART_TIMES + 1;
+
+void applyRotation(double &dx, double &dy, double &cs, double &sn) {
+    double temp = cs * dx + sn * dy;
+    dy = (-sn) * dx + cs * dy;
+    dx = temp;
+}
+
+void generateRotation(double &dx, double &dy, double &cs, double &sn) {
+    if (dx == double(0)) {
+        cs = double(0);
+        sn = double(1);
+    } else {
+        double scale = fabs(dx) + fabs(dy);
+        double norm = scale * std::sqrt(fabs(dx / scale) * fabs(dx / scale) +
+                                        fabs(dy / scale) * fabs(dy / scale));
+        double alpha = dx / fabs(dx);
+        cs = fabs(dx) / norm;
+        sn = alpha * dy / norm;
+    }
+}
+
+void rotation2(uint Am, double *H, double *cs, double *sn, double *s, uint i) {
+    // 缓存优化: H 矩阵按列主序访问
+    for (uint k = 0; k < i; k++) {
+        applyRotation(H[i * H_NUM_ROWS + k], H[i * H_NUM_ROWS + (k + 1)], cs[k], sn[k]);
+    }
+    generateRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(s[i], s[i + 1], cs[i], sn[i]);
+}
+
+double calculateNorm(const double *vec, uint N) {
+    // AVX-512 优化: 一次处理 8 个 double
+    const int stride = 8;
+    __m512d sum_vec = _mm512_setzero_pd(); // 初始化向量累加器为0
+    uint i = 0;
+    for (; i + stride <= N; i += stride) {
+        __m512d v_vec = _mm512_loadu_pd(vec + i); // 加载 8 个 double
+        // 使用 FMA 指令: sum_vec = (v_vec * v_vec) + sum_vec
+        sum_vec = _mm512_fmadd_pd(v_vec, v_vec, sum_vec);
+    }
+    // 将向量寄存器中的 8 个部分和加到一个标量上
+    double sum = _mm512_reduce_add_pd(sum_vec);
+
+    // 处理剩余的 (N % 8) 个元素
+    for (; i < N; ++i) {
+        sum += vec[i] * vec[i];
+    }
+    return std::sqrt(sum);
+}
+
+void spmv(const uint *rowPtr, const uint *colInd, const double *values,
+          const double *x, double *y, uint numRows) {
+    #pragma omp parallel for schedule(static) //TODO
+    // spmv 由于间接访存 (x[colInd[j]])，手动向量化非常困难且收益不大
+    // 我们依赖 Makefile 中的 -O3 -march=native 让编译器尽力优化
+    for (uint i = 0; i < numRows; ++i) {
+        double sum = 0.0;
+        for (uint j = rowPtr[i]; j < rowPtr[i + 1]; ++j) {
+            sum += values[j] * x[colInd[j]];
+        }
+        y[i] = sum;
+    }
+}
+
+double dotProduct(const double *x, const double *y, uint N) {
+    // AVX-512 优化:
+    const int stride = 8;
+    __m512d sum_vec = _mm512_setzero_pd();
+    uint i = 0;
+    for (; i + stride <= N; i += stride) {
+        __m512d x_vec = _mm512_loadu_pd(x + i);
+        __m512d y_vec = _mm512_loadu_pd(y + i);
+        // 使用 FMA 指令: sum_vec = (x_vec * y_vec) + sum_vec
+        sum_vec = _mm512_fmadd_pd(x_vec, y_vec, sum_vec);
+    }
+    double sum = _mm512_reduce_add_pd(sum_vec);
+
+    // 处理剩余元素
+    for (; i < N; ++i) {
+        sum += x[i] * y[i];
+    }
+    return sum;
+}
+
+void daxpy(double alpha, const double *x, double *y, uint N) {
+    // AVX-512 优化:
+    const int stride = 8;
+    __m512d alpha_vec = _mm512_set1_pd(alpha); // 将标量 alpha 广播到向量的所有通道
+    uint i = 0;
+    for (; i + stride <= N; i += stride) {
+        __m512d x_vec = _mm512_loadu_pd(x + i);
+        __m512d y_vec = _mm512_loadu_pd(y + i);
+        // 使用 FMA 指令: y_vec = (alpha_vec * x_vec) + y_vec
+        y_vec = _mm512_fmadd_pd(alpha_vec, x_vec, y_vec);
+        _mm512_storeu_pd(y + i, y_vec); // 将结果写回内存
+    }
+    // 处理剩余元素
+    for (; i < N; ++i) {
+        y[i] += alpha * x[i];
+    }
+}
+
+void dscal(double alpha, double *x, uint N) {
+    // AVX-512 优化:
+    const int stride = 8;
+    __m512d alpha_vec = _mm512_set1_pd(alpha);
+    uint i = 0;
+    for (; i + stride <= N; i += stride) {
+        __m512d x_vec = _mm512_loadu_pd(x + i);
+        x_vec = _mm512_mul_pd(alpha_vec, x_vec); // x_vec = alpha_vec * x_vec
+        _mm512_storeu_pd(x + i, x_vec);
+    }
+    // 处理剩余元素
+    for (; i < N; ++i) {
+        x[i] *= alpha;
+    }
+}
+
+void dcopy(const double *src, double *dst, uint N) {
+    // AVX-512 优化:
+    const int stride = 8;
+    uint i = 0;
+    for (; i + stride <= N; i += stride) {
+        __m512d src_vec = _mm512_loadu_pd(src + i);
+        _mm512_storeu_pd(dst + i, src_vec);
+    }
+    // 处理剩余元素
+    for (; i < N; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+void sovlerTri(int Am, int i, double *H, double *s) {
+    // 缓存优化: H 矩阵按列主序访问
+    for (int j = i; j >= 0; j--) {
+        s[j] /= H[j * H_NUM_ROWS + j];
+        for (int k = j - 1; k >= 0; k--) {
+            s[k] -= H[j * H_NUM_ROWS + k] * s[j];
+        }
+    }
+}
+
+RESULT gmres(SpM<double> *A_d, double *x_d, double *_b) {
+    // 若要采用其他的稀疏矩阵压缩格式，需从CSR矩阵开始转换，且格式转换的代码必须包含到计时范围内
+    const uint N = A_d->nrows;
+
+    std::vector<double> r0(N);
+    std::vector<double> V((RESTART_TIMES + 1) * N);
+    std::vector<double> s(RESTART_TIMES + 1, 0.0);
+    std::vector<double> H(H_NUM_ROWS * RESTART_TIMES);
+    std::vector<double> cs(RESTART_TIMES);
+    std::vector<double> sn(RESTART_TIMES);
+
+    double H_cpu;
+    double beta_cpu;
+
+    double alpha;
+
+    double beta;
+    beta = calculateNorm(_b, N);
+    double RESID_LIMIT = REL_RESID_LIMIT * beta;
+    double init_res = beta;
+
+    int i, j, k;
+    double resid;
+    int iteration = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();  // 禁止修改
+
+    // 任何对稀疏矩阵的预处理操作，如稀疏矩阵压缩格式转换、非零元数组或向量的精度转换、稀疏矩阵的非零元特征计算等，均需放在计时范围内，相关内存申请和释放除外
+
+    /****GMRES计算过程****/
+    do {
+        // ==========外迭代============
+        
+        spmv(A_d->rows, A_d->cols, A_d->vals, x_d, r0.data(),
+             N);  // 不可修改此步操作中相关数据的存储精度和SpMV计算精度
+
+        alpha = -1.0;
+        daxpy(alpha, _b, r0.data(), N);
+
+        beta = calculateNorm(r0.data(), N);
+
+        alpha = -1.0 / beta;
+        dscal(alpha, r0.data(), N);
+
+        dcopy(r0.data(), V.data(), N);
+
+        // 初始化残差向量
+        fill(s.begin(), s.end(), 0.0);
+        s[0] = beta;
+
+        resid = std::abs(beta);
+        i = -1;
+
+        if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+            break;
+        }
+        do {
+            // ==========内迭代============
+            i++;
+            iteration++;
+            
+            // 优化: 消除临时向量 V_i 的创建和 dcopy 调用
+            // 直接将指向 V 矩阵第 i 列的指针传递给 spmv
+            spmv(A_d->rows, A_d->cols, A_d->vals, V.data() + i * N, r0.data(), N);
+
+            for (k = 0; k <= i; k++) {
+                // 缓存优化: H 矩阵按列主序写入
+                H[i * H_NUM_ROWS + k] =
+                    dotProduct(r0.data(), V.data() + k * N, N);
+
+                alpha = -H[i * H_NUM_ROWS + k];
+                daxpy(alpha, V.data() + N * k, r0.data(), N);
+            }
+            H[i * H_NUM_ROWS + (i + 1)] = calculateNorm(r0.data(), N);
+
+            alpha = 1.0 / H[i * H_NUM_ROWS + (i + 1)];
+            dscal(alpha, r0.data(), N);
+            dcopy(r0.data(), V.data() + N * (i + 1), N);
+
+            rotation2(RESTART_TIMES, H.data(), cs.data(), sn.data(), s.data(),
+                      i);
+
+            resid = std::abs(s[i + 1]);
+            // std::cout << "iteration " << iteration << ", resid = " <<
+            // resid/init_res << std::endl;
+
+            if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+                break;
+            }
+        } while (i + 1 < RESTART_TIMES && iteration <= ITERATION_LIMIT);
+
+        // 求解上三角系统
+        sovlerTri(RESTART_TIMES, i, H.data(), s.data());
+
+        // 更新解
+        for (j = 0; j <= i; j++) {
+            daxpy(s[j], V.data() + j * N, x_d, N);
+        }
+    } while (resid > RESID_LIMIT && iteration <= ITERATION_LIMIT);
+
+    auto stop = std::chrono::high_resolution_clock::now();  // 禁止修改
+    std::chrono::duration<float, std::milli> duration =
+        stop - start;                    // 禁止修改
+    float test_time = duration.count();  // 禁止修改
+
+    return make_tuple(iteration, test_time, resid / init_res);  // 禁止修改
+}
+
+// 此函数不在计时区域内，不得改变精度
+void initialize(SpM<double> *A, double *x, double *b) {
+    int N = A->nrows;
+
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(i);
+    }
+
+    double beta = calculateNorm(x, N);  // 可修改，但不可改变精度
+    for (uint i = 0; i < N; i++) {
+        x[i] /= beta;
+    }
+
+    spmv(A->rows, A->cols, A->vals, x, b, N);  // 可修改，但不可改变精度
+
+    for (uint i = 0; i < N; i++) x[i] = 0.0;
+}

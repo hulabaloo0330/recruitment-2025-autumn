@@ -1,0 +1,364 @@
+#include <stdio.h>
+#include <assert.h>
+#include <iostream>
+#include <vector>
+#include <tuple>
+#include <cmath>
+#include <cassert>
+#include <chrono>
+// 使用 Intel Intrinsics 头文件来利用 AVX-512
+#include <immintrin.h>
+
+#include "sparseMatrix.hpp"
+#include "gmres.hpp"
+
+using namespace std;
+
+const int RESTART_TIMES = 20;         // 禁止修改
+const double REL_RESID_LIMIT = 1e-6;  // 禁止修改
+const int ITERATION_LIMIT = 10000;    // 禁止修改
+
+// 缓存优化: H 矩阵现在按列主序存储.
+// H[row][col] -> H[col * num_rows + row]
+const int H_NUM_ROWS = RESTART_TIMES + 1;
+
+// 预计算常量，避免重复计算
+const int V_STRIDE = RESTART_TIMES + 1;
+
+// 内联关键函数
+inline void applyRotation(double &dx, double &dy, double &cs, double &sn) {
+    double temp = cs * dx + sn * dy;
+    dy = (-sn) * dx + cs * dy;
+    dx = temp;
+}
+
+inline void generateRotation(double &dx, double &dy, double &cs, double &sn) {
+    if (dx == double(0)) {
+        cs = double(0);
+        sn = double(1);
+    } else {
+        // 优化：避免重复计算绝对值
+        double abs_dx = fabs(dx);
+        double abs_dy = fabs(dy);
+        double scale = abs_dx + abs_dy;
+        double ratio_x = abs_dx / scale;
+        double ratio_y = abs_dy / scale;
+        double norm = scale * std::sqrt(ratio_x * ratio_x + ratio_y * ratio_y);
+        double alpha = dx > 0 ? 1.0 : -1.0;
+        cs = abs_dx / norm;
+        sn = alpha * dy / norm;
+    }
+}
+
+void rotation2(uint Am, double *H, double *cs, double *sn, double *s, uint i) {
+    // 缓存优化: H 矩阵按列主序存储
+    for (uint k = 0; k < i; k++) {
+        applyRotation(H[i * H_NUM_ROWS + k], H[i * H_NUM_ROWS + (k + 1)], cs[k], sn[k]);
+    }
+    generateRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(s[i], s[i + 1], cs[i], sn[i]);
+}
+
+// 修复的AVX-512范数计算 - 使用安全的未对齐访问
+double calculateNorm(const double *vec, uint N) {
+    const int avx512_stride = 8;
+    __m512d sum_vec = _mm512_setzero_pd();
+    uint i = 0;
+    
+    // 主循环 - 使用未对齐加载确保安全
+    for (; i + avx512_stride <= N; i += avx512_stride) {
+        __m512d v = _mm512_loadu_pd(vec + i);  // 使用loadu而不是load
+        sum_vec = _mm512_fmadd_pd(v, v, sum_vec);
+    }
+    
+    double sum = _mm512_reduce_add_pd(sum_vec);
+    
+    // 处理尾部
+    for (; i < N; ++i) {
+        sum += vec[i] * vec[i];
+    }
+    
+    return std::sqrt(sum);
+}
+
+// 修复的SpMV - 移除预取，简化循环展开
+void spmv(const uint *rowPtr, const uint *colInd, const double *values,
+          const double *x, double *y, uint numRows) {
+    for (uint i = 0; i < numRows; ++i) {
+        double sum = 0.0;
+        uint row_start = rowPtr[i];
+        uint row_end = rowPtr[i + 1];
+        
+        uint j = row_start;
+        // 简化的循环展开，避免复杂的边界检查
+        for (; j < row_end; ++j) {
+            sum += values[j] * x[colInd[j]];
+        }
+        
+        y[i] = sum;
+    }
+}
+
+// 修复的点积计算
+double dotProduct(const double *x, const double *y, uint N) {
+    const int avx512_stride = 8;
+    __m512d sum_vec = _mm512_setzero_pd();
+    uint i = 0;
+    
+    // 主循环 - 使用未对齐访问
+    for (; i + avx512_stride <= N; i += avx512_stride) {
+        __m512d x_vec = _mm512_loadu_pd(x + i);
+        __m512d y_vec = _mm512_loadu_pd(y + i);
+        sum_vec = _mm512_fmadd_pd(x_vec, y_vec, sum_vec);
+    }
+    
+    double sum = _mm512_reduce_add_pd(sum_vec);
+    
+    // 处理尾部
+    for (; i < N; ++i) {
+        sum += x[i] * y[i];
+    }
+    
+    return sum;
+}
+
+// 修复的daxpy
+void daxpy(double alpha, const double *x, double *y, uint N) {
+    const int avx512_stride = 8;
+    __m512d alpha_vec = _mm512_set1_pd(alpha);
+    uint i = 0;
+    
+    // 主循环 - 使用未对齐访问
+    for (; i + avx512_stride <= N; i += avx512_stride) {
+        __m512d x_vec = _mm512_loadu_pd(x + i);
+        __m512d y_vec = _mm512_loadu_pd(y + i);
+        y_vec = _mm512_fmadd_pd(alpha_vec, x_vec, y_vec);
+        _mm512_storeu_pd(y + i, y_vec);  // 使用storeu
+    }
+    
+    // 处理尾部
+    for (; i < N; ++i) {
+        y[i] += alpha * x[i];
+    }
+}
+
+// 修复的dscal
+void dscal(double alpha, double *x, uint N) {
+    const int avx512_stride = 8;
+    __m512d alpha_vec = _mm512_set1_pd(alpha);
+    uint i = 0;
+    
+    // 主循环 - 使用未对齐访问
+    for (; i + avx512_stride <= N; i += avx512_stride) {
+        __m512d x_vec = _mm512_loadu_pd(x + i);
+        x_vec = _mm512_mul_pd(alpha_vec, x_vec);
+        _mm512_storeu_pd(x + i, x_vec);  // 使用storeu
+    }
+    
+    // 处理尾部
+    for (; i < N; ++i) {
+        x[i] *= alpha;
+    }
+}
+
+// 修复的dcopy
+void dcopy(const double *src, double *dst, uint N) {
+    const int avx512_stride = 8;
+    uint i = 0;
+    
+    // 主循环 - 使用未对齐访问
+    for (; i + avx512_stride <= N; i += avx512_stride) {
+        __m512d src_vec = _mm512_loadu_pd(src + i);
+        _mm512_storeu_pd(dst + i, src_vec);  // 使用storeu
+    }
+    
+    // 处理尾部
+    for (; i < N; ++i) {
+        dst[i] = src[i];
+    }
+}
+
+void sovlerTri(int Am, int i, double *H, double *s) {
+    // 缓存优化: H 矩阵按列主序存储
+    for (int j = i; j >= 0; j--) {
+        // 添加边界检查
+        if (j * H_NUM_ROWS + j >= H_NUM_ROWS * RESTART_TIMES) continue;
+        s[j] /= H[j * H_NUM_ROWS + j];
+        double s_j = s[j]; // 缓存变量
+        for (int k = j - 1; k >= 0; k--) {
+            if (j * H_NUM_ROWS + k >= H_NUM_ROWS * RESTART_TIMES) continue;
+            s[k] -= H[j * H_NUM_ROWS + k] * s_j;
+        }
+    }
+}
+
+RESULT gmres(SpM<double> *A_d, double *x_d, double *_b) {
+    const uint N = A_d->nrows;
+
+    // 预分配内存，避免重复分配
+    std::vector<double> r0(N);
+    std::vector<double> V((RESTART_TIMES + 1) * N);
+    std::vector<double> s(RESTART_TIMES + 1, 0.0);
+    std::vector<double> H(H_NUM_ROWS * RESTART_TIMES, 0.0);
+    std::vector<double> cs(RESTART_TIMES, 0.0);
+    std::vector<double> sn(RESTART_TIMES, 0.0);
+
+    // 检查矩阵有效性
+    if (A_d == nullptr || A_d->rows == nullptr || A_d->cols == nullptr || A_d->vals == nullptr) {
+        std::cerr << "错误: 无效的稀疏矩阵" << std::endl;
+        return make_tuple(0, 0.0f, 1.0);
+    }
+
+    double alpha;
+    double beta;
+    beta = calculateNorm(_b, N);
+    double RESID_LIMIT = REL_RESID_LIMIT * beta;
+    double init_res = beta;
+
+    int i, j, k;
+    double resid;
+    int iteration = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();  // 禁止修改
+
+    /****GMRES求解循环主体****/
+    do {
+        // ==========外层循环============
+        spmv(A_d->rows, A_d->cols, A_d->vals, x_d, r0.data(), N);
+
+        // 合并操作：r0 = r0 - _b
+        alpha = -1.0;
+        daxpy(alpha, _b, r0.data(), N);
+
+        beta = calculateNorm(r0.data(), N);
+
+        // 检查beta是否为0
+        if (beta < 1e-15) {
+            resid = 0.0;
+            break;
+        }
+
+        // 归一化：r0 = -r0 / beta
+        alpha = -1.0 / beta;
+        dscal(alpha, r0.data(), N);
+
+        dcopy(r0.data(), V.data(), N);
+
+        // 优化：使用memset重置s向量
+        if (s.size() > 0) {
+            s[0] = beta;
+            if (s.size() > 1) {
+                memset(s.data() + 1, 0, (s.size() - 1) * sizeof(double));
+            }
+        }
+
+        resid = std::abs(beta);
+        i = -1;
+
+        if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+            break;
+        }
+        
+        do {
+            // ==========内层循环============
+            i++;
+            iteration++;
+            
+            // 边界检查
+            if (i * N >= V.size()) {
+                std::cerr << "警告: V矩阵索引越界" << std::endl;
+                break;
+            }
+            
+            // 使用预计算的步长
+            double* V_i = V.data() + i * N;
+            spmv(A_d->rows, A_d->cols, A_d->vals, V_i, r0.data(), N);
+
+            // Arnoldi过程
+            for (k = 0; k <= i; k++) {
+                // 边界检查
+                if (k * N >= V.size() || i * H_NUM_ROWS + k >= H.size()) {
+                    continue;
+                }
+                
+                double* V_k = V.data() + k * N;
+                H[i * H_NUM_ROWS + k] = dotProduct(r0.data(), V_k, N);
+                
+                alpha = -H[i * H_NUM_ROWS + k];
+                daxpy(alpha, V_k, r0.data(), N);
+            }
+            
+            // 边界检查
+            if (i * H_NUM_ROWS + (i + 1) < H.size()) {
+                H[i * H_NUM_ROWS + (i + 1)] = calculateNorm(r0.data(), N);
+            }
+
+            // 直接除法，无需稳定性检查
+            if (H[i * H_NUM_ROWS + (i + 1)] > 1e-15) {
+                alpha = 1.0 / H[i * H_NUM_ROWS + (i + 1)];
+                dscal(alpha, r0.data(), N);
+            }
+            
+            // 边界检查
+            if ((i + 1) * N < V.size()) {
+                dcopy(r0.data(), V.data() + (i + 1) * N, N);
+            }
+
+            rotation2(RESTART_TIMES, H.data(), cs.data(), sn.data(), s.data(), i);
+
+            resid = std::abs(s[i + 1]);
+
+            if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+                break;
+            }
+        } while (i + 1 < RESTART_TIMES && iteration <= ITERATION_LIMIT);
+
+        // 解三角系统更新解系数
+        sovlerTri(RESTART_TIMES, i, H.data(), s.data());
+
+        // 更新最终解
+        for (j = 0; j <= i; j++) {
+            if (j * N < V.size()) {
+                daxpy(s[j], V.data() + j * N, x_d, N);
+            }
+        }
+        
+    } while (resid > RESID_LIMIT && iteration <= ITERATION_LIMIT);
+
+    auto stop = std::chrono::high_resolution_clock::now();  // 禁止修改
+    std::chrono::duration<float, std::milli> duration = stop - start; // 禁止修改
+    float test_time = duration.count();  // 禁止修改
+
+    return make_tuple(iteration, test_time, resid / init_res);  // 禁止修改
+}
+
+// 优化initialize函数
+void initialize(SpM<double> *A, double *x, double *b) {
+    int N = A->nrows;
+
+    // 检查指针有效性
+    if (A == nullptr || A->rows == nullptr || A->cols == nullptr || A->vals == nullptr) {
+        std::cerr << "错误: 在initialize中接收到无效的矩阵" << std::endl;
+        return;
+    }
+
+    // 使用向量化友好的初始化
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(i);
+    }
+
+    double beta = calculateNorm(x, N);
+    
+    // 归一化
+    if (beta > 1e-15) {
+        dscal(1.0 / beta, x, N);
+    }
+
+    spmv(A->rows, A->cols, A->vals, x, b, N);
+
+    // 重置x为0
+    if (x != nullptr) {
+        memset(x, 0, N * sizeof(double));
+    }
+}

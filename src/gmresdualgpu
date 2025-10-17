@@ -1,0 +1,365 @@
+#include "gmres.hpp" // 包含官方头文件
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <iostream>
+#include <numeric>
+
+// --- 并行计算核心头文件 ---
+#include <omp.h> // 使用 OpenMP
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cusparse.h>
+
+const int RESTART_TIMES = 20;         // 禁止修改
+const double REL_RESID_LIMIT = 1e-6;  // 禁止修改
+const int ITERATION_LIMIT = 10000;    // 禁止修改
+
+const int H_NUM_ROWS = RESTART_TIMES + 1;
+const int NUM_GPUS = 2; // 我们明确使用 2 个 GPU
+
+// --- CUDA API Error Checking Macro ---
+#define CUDA_CHECK(err) { \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// --- cuBLAS API Error Checking Macro ---
+#define CUBLAS_CHECK(err) { \
+    if (err != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS Error at %s:%d\n", __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// --- cuSPARSE API Error Checking Macro ---
+#define CUSPARSE_CHECK(err) { \
+    if (err != CUSPARSE_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuSPARSE Error at %s:%d\n", __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// =========================================================================
+// 内部辅助函数 (与之前相同)
+// =========================================================================
+static void applyRotation(double &dx, double &dy, double &cs, double &sn) {
+    double temp = cs * dx + sn * dy;
+    dy = (-sn) * dx + cs * dy;
+    dx = temp;
+}
+
+static void generateRotation(double &dx, double &dy, double &cs, double &sn) {
+    if (dx == 0.0) {
+        cs = 0.0;
+        sn = 1.0;
+    } else {
+        double scale = std::abs(dx) + std::abs(dy);
+        double norm = scale * std::sqrt((dx / scale) * (dx / scale) + (dy / scale) * (dy / scale));
+        double alpha = dx > 0 ? 1.0 : -1.0;
+        cs = std::abs(dx) / norm;
+        sn = alpha * dy / norm;
+    }
+}
+
+static void rotation2(uint Am, double *H, double *cs, double *sn, double *s, uint i) {
+    for (uint k = 0; k < i; k++) {
+        applyRotation(H[i * H_NUM_ROWS + k], H[i * H_NUM_ROWS + (k + 1)], cs[k], sn[k]);
+    }
+    generateRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(s[i], s[i + 1], cs[i], sn[i]);
+}
+
+static void sovlerTri(int Am, int i, double *H, double *s) {
+    for (int j = i; j >= 0; j--) {
+        s[j] /= H[j * H_NUM_ROWS + j];
+        for (int k = j - 1; k >= 0; k--) {
+            s[k] -= H[j * H_NUM_ROWS + k] * s[j];
+        }
+    }
+}
+
+// initialize 函数保持不变, 稍微用 OpenMP 加速了一下
+void initialize(SpM<double> *A, double *x, double *b) {
+    int N = A->nrows;
+    std::vector<double> temp_x(N);
+
+    #pragma omp parallel for
+    for (int i = 0; i < N; i++) {
+        temp_x[i] = sin(i);
+    }
+    double beta = 0;
+    #pragma omp parallel for reduction(+:beta)
+    for (int i = 0; i < N; i++) {
+        beta += temp_x[i] * temp_x[i];
+    }
+    beta = std::sqrt(beta);
+
+    #pragma omp parallel for
+    for (uint i = 0; i < N; i++) {
+        temp_x[i] /= beta;
+    }
+
+    #pragma omp parallel for
+    for (uint i = 0; i < N; ++i) {
+        double sum = 0.0;
+        for (uint j = A->rows[i]; j < A->rows[i + 1]; ++j) {
+            sum += A->vals[j] * temp_x[A->cols[j]];
+        }
+        b[i] = sum;
+    }
+
+    #pragma omp parallel for
+    for (uint i = 0; i < N; i++) x[i] = 0.0;
+}
+
+
+// 双 GPU 并行版本的 GMRES
+RESULT gmres(SpM<double> *A_h, double *x_h, double *b_h) {
+    // --- 启用 GPU P2P 访问 ---
+    int can_access_peer = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, 0, 1));
+    if (can_access_peer) {
+        cudaSetDevice(0);
+        CUDA_CHECK(cudaDeviceEnablePeerAccess(1, 0));
+        cudaSetDevice(1);
+        CUDA_CHECK(cudaDeviceEnablePeerAccess(0, 0));
+    } else {
+        fprintf(stderr, "警告: GPU 0 和 GPU 1 之间不支持点对点访问。\n");
+    }
+
+    // --- 全局和 Host 端数据 ---
+    const uint N_global = A_h->nrows;
+    std::vector<double> s(RESTART_TIMES + 1, 0.0);
+    std::vector<double> H(H_NUM_ROWS * RESTART_TIMES, 0.0);
+    std::vector<double> cs(RESTART_TIMES, 0.0);
+    std::vector<double> sn(RESTART_TIMES, 0.0);
+    
+    double h_reduction_results[NUM_GPUS];
+    
+    int iteration = 0;
+    double resid = 0.0, init_res = 0.0;
+    
+    double *d_peer_pointers[NUM_GPUS];
+
+    auto start = std::chrono::high_resolution_clock::now();  // 禁止修改
+    
+    // --- OpenMP 并行区域 ---
+    #pragma omp parallel num_threads(NUM_GPUS)
+    {
+        int device_id = omp_get_thread_num();
+        cudaSetDevice(device_id);
+
+        uint N_local = N_global / NUM_GPUS;
+        uint N_start_row = device_id * N_local;
+        uint N_end_row = (device_id == NUM_GPUS - 1) ? N_global : (device_id + 1) * N_local;
+        uint N_local_actual = N_end_row - N_start_row;
+
+        cublasHandle_t cublas_handle;
+        cusparseHandle_t cusparse_handle;
+        cudaStream_t stream;
+        CUBLAS_CHECK(cublasCreate(&cublas_handle));
+        CUSPARSE_CHECK(cusparseCreate(&cusparse_handle));
+        CUDA_CHECK(cudaStreamCreate(&stream));
+        CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+        CUSPARSE_CHECK(cusparseSetStream(cusparse_handle, stream));
+
+        uint NNZ_start = A_h->rows[N_start_row];
+        uint NNZ_end = A_h->rows[N_end_row];
+        uint NNZ_local = NNZ_end - NNZ_start;
+
+        cusparseSpMatDescr_t matA_local;
+        void *d_rows_local, *d_cols_local, *d_vals_local;
+        CUDA_CHECK(cudaMalloc(&d_rows_local, (N_local_actual + 1) * sizeof(uint)));
+        CUDA_CHECK(cudaMalloc(&d_cols_local, NNZ_local * sizeof(uint)));
+        CUDA_CHECK(cudaMalloc(&d_vals_local, NNZ_local * sizeof(double)));
+
+        std::vector<uint> rows_local_h(N_local_actual + 1);
+        for(uint i = 0; i <= N_local_actual; ++i) {
+            rows_local_h[i] = A_h->rows[N_start_row + i] - NNZ_start;
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(d_rows_local, rows_local_h.data(), (N_local_actual + 1) * sizeof(uint), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_cols_local, A_h->cols + NNZ_start, NNZ_local * sizeof(uint), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_vals_local, A_h->vals + NNZ_start, NNZ_local * sizeof(double), cudaMemcpyHostToDevice, stream));
+
+        CUSPARSE_CHECK(cusparseCreateCsr(&matA_local, N_local_actual, N_global, NNZ_local, d_rows_local, d_cols_local, d_vals_local, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+        
+        double *x_d_local, *b_d_local, *r_d_local, *V_d_local;
+        double *spmv_input_vec_d;
+        CUDA_CHECK(cudaMalloc((void **)&x_d_local, N_local_actual * sizeof(double)));
+        CUDA_CHECK(cudaMalloc((void **)&b_d_local, N_local_actual * sizeof(double)));
+        CUDA_CHECK(cudaMalloc((void **)&r_d_local, N_local_actual * sizeof(double)));
+        CUDA_CHECK(cudaMalloc((void **)&V_d_local, (RESTART_TIMES + 1) * N_local_actual * sizeof(double)));
+        CUDA_CHECK(cudaMalloc((void **)&spmv_input_vec_d, N_global * sizeof(double)));
+        
+        d_peer_pointers[device_id] = x_d_local;
+
+        CUDA_CHECK(cudaMemcpyAsync(x_d_local, x_h + N_start_row, N_local_actual * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(b_d_local, b_h + N_start_row, N_local_actual * sizeof(double), cudaMemcpyHostToDevice, stream));
+
+        void *d_buffer = nullptr;
+        size_t buffer_size = 0;
+        const double gpu_alpha_one = 1.0, gpu_beta_zero = 0.0, gpu_minus_one = -1.0;
+        cusparseDnVecDescr_t vec_spmv_input, vec_spmv_output;
+        CUSPARSE_CHECK(cusparseCreateDnVec(&vec_spmv_input, N_global, spmv_input_vec_d, CUDA_R_64F));
+        CUSPARSE_CHECK(cusparseCreateDnVec(&vec_spmv_output, N_local_actual, r_d_local, CUDA_R_64F));
+        CUSPARSE_CHECK(cusparseSpMV_bufferSize(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &gpu_alpha_one, matA_local, vec_spmv_input, &gpu_beta_zero, vec_spmv_output, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &buffer_size));
+        CUDA_CHECK(cudaMalloc(&d_buffer, buffer_size));
+        
+        #pragma omp barrier
+        #pragma omp single
+        {
+            double beta_sq_sum = 0;
+            for(int i = 0; i < N_global; ++i) beta_sq_sum += b_h[i] * b_h[i];
+            init_res = std::sqrt(beta_sq_sum);
+            resid = init_res;
+        }
+
+        double RESID_LIMIT = REL_RESID_LIMIT * init_res;
+
+        do {
+            int peer_id = 1 - device_id;
+            uint peer_start_row = peer_id * N_local;
+            uint peer_local_actual = N_global - N_local_actual;
+
+            CUDA_CHECK(cudaMemcpyAsync(spmv_input_vec_d + N_start_row, x_d_local, N_local_actual * sizeof(double), cudaMemcpyDeviceToDevice, stream));
+            #pragma omp barrier // 确保两个线程都准备好了自己的指针
+            CUDA_CHECK(cudaMemcpyPeerAsync(spmv_input_vec_d + peer_start_row, device_id, d_peer_pointers[peer_id], peer_id, peer_local_actual * sizeof(double), stream));
+            
+            CUSPARSE_CHECK(cusparseSpMV(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &gpu_alpha_one, matA_local, vec_spmv_input, &gpu_beta_zero, vec_spmv_output, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, d_buffer));
+            
+            CUDA_CHECK(cudaMemcpyAsync(r_d_local, b_d_local, N_local_actual * sizeof(double), cudaMemcpyDeviceToDevice, stream));
+            // **FIXED**: 直接使用 r_d_local，它就是 vec_spmv_output 的数据指针
+            CUBLAS_CHECK(cublasDaxpy(cublas_handle, N_local_actual, &gpu_minus_one, r_d_local, 1, r_d_local, 1));
+
+            double beta_local_sq;
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, N_local_actual, r_d_local, 1, &beta_local_sq));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            h_reduction_results[device_id] = beta_local_sq * beta_local_sq;
+            #pragma omp barrier
+            #pragma omp single
+            {
+                double beta = std::sqrt(h_reduction_results[0] + h_reduction_results[1]);
+                s[0] = beta;
+                resid = beta;
+            }
+            #pragma omp barrier
+
+            const double alpha_scal = (s[0] == 0.0) ? 1.0 : 1.0 / s[0];
+            CUBLAS_CHECK(cublasDscal(cublas_handle, N_local_actual, &alpha_scal, r_d_local, 1));
+            CUBLAS_CHECK(cublasDcopy(cublas_handle, N_local_actual, r_d_local, 1, V_d_local, 1));
+
+            if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+                #pragma omp single
+                iteration = (iteration == 0) ? 1 : iteration;
+                break;
+            }
+
+            int i = -1;
+            do {
+                i++;
+                #pragma omp single
+                iteration++;
+
+                double* V_i_local = V_d_local + i * N_local_actual;
+                d_peer_pointers[device_id] = V_i_local;
+                
+                CUDA_CHECK(cudaMemcpyAsync(spmv_input_vec_d + N_start_row, V_i_local, N_local_actual * sizeof(double), cudaMemcpyDeviceToDevice, stream));
+                #pragma omp barrier
+                CUDA_CHECK(cudaMemcpyPeerAsync(spmv_input_vec_d + peer_start_row, device_id, d_peer_pointers[peer_id], peer_id, peer_local_actual * sizeof(double), stream));
+                
+                CUSPARSE_CHECK(cusparseSpMV(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE, &gpu_alpha_one, matA_local, vec_spmv_input, &gpu_beta_zero, vec_spmv_output, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, d_buffer));
+
+                for (int k = 0; k <= i; k++) {
+                    double* V_k_local = V_d_local + k * N_local_actual;
+                    double h_val_local, h_val;
+                    // **FIXED**: 直接使用 r_d_local
+                    CUBLAS_CHECK(cublasDdot(cublas_handle, N_local_actual, r_d_local, 1, V_k_local, 1, &h_val_local));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    h_reduction_results[device_id] = h_val_local;
+                    #pragma omp barrier
+                    #pragma omp single
+                    {
+                       h_val = h_reduction_results[0] + h_reduction_results[1];
+                       H[i * H_NUM_ROWS + k] = h_val;
+                    }
+                    #pragma omp barrier
+                    const double alpha_daxpy = -H[i * H_NUM_ROWS + k];
+                    // **FIXED**: 直接使用 r_d_local
+                    CUBLAS_CHECK(cublasDaxpy(cublas_handle, N_local_actual, &alpha_daxpy, V_k_local, 1, r_d_local, 1));
+                }
+
+                double h_norm_local_sq, h_norm;
+                // **FIXED**: 直接使用 r_d_local
+                CUBLAS_CHECK(cublasDnrm2(cublas_handle, N_local_actual, r_d_local, 1, &h_norm_local_sq));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                h_reduction_results[device_id] = h_norm_local_sq * h_norm_local_sq;
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    h_norm = std::sqrt(h_reduction_results[0] + h_reduction_results[1]);
+                    H[i * H_NUM_ROWS + (i + 1)] = h_norm;
+                }
+                #pragma omp barrier
+
+                if (H[i * H_NUM_ROWS + (i + 1)] != 0.0) {
+                    const double alpha_dscal_2 = 1.0 / H[i * H_NUM_ROWS + (i + 1)];
+                    // **FIXED**: 直接使用 r_d_local
+                    CUBLAS_CHECK(cublasDscal(cublas_handle, N_local_actual, &alpha_dscal_2, r_d_local, 1));
+                }
+                // **FIXED**: 直接使用 r_d_local
+                CUBLAS_CHECK(cublasDcopy(cublas_handle, N_local_actual, r_d_local, 1, V_d_local + (i + 1) * N_local_actual, 1));
+                
+                #pragma omp single
+                {
+                    rotation2(RESTART_TIMES, H.data(), cs.data(), sn.data(), s.data(), i);
+                    resid = std::abs(s[i + 1]);
+                }
+                #pragma omp barrier
+
+                if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) break;
+            } while (i + 1 < RESTART_TIMES && iteration <= ITERATION_LIMIT);
+            
+            #pragma omp single
+            {
+                sovlerTri(RESTART_TIMES, i, H.data(), s.data());
+            }
+            #pragma omp barrier
+            
+            for (int j = 0; j <= i; j++) {
+                CUBLAS_CHECK(cublasDaxpy(cublas_handle, N_local_actual, &s[j], V_d_local + j * N_local_actual, 1, x_d_local, 1));
+            }
+            #pragma omp barrier
+            d_peer_pointers[device_id] = x_d_local;
+        } while (resid > RESID_LIMIT && iteration <= ITERATION_LIMIT);
+
+        CUDA_CHECK(cudaMemcpyAsync(x_h + N_start_row, x_d_local, N_local_actual * sizeof(double), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        cudaFree(d_buffer);
+        cusparseDestroyDnVec(vec_spmv_input);
+        cusparseDestroyDnVec(vec_spmv_output);
+        cusparseDestroySpMat(matA_local);
+        cudaFree(d_rows_local);
+        cudaFree(d_cols_local);
+        cudaFree(d_vals_local);
+        cudaFree(x_d_local);
+        cudaFree(b_d_local);
+        cudaFree(r_d_local);
+        cudaFree(V_d_local);
+        cudaFree(spmv_input_vec_d);
+        cusparseDestroy(cusparse_handle);
+        cublasDestroy(cublas_handle);
+        cudaStreamDestroy(stream);
+    }
+
+    auto stop = std::chrono::high_resolution_clock::now();  // 禁止修改
+    std::chrono::duration<float, std::milli> duration = stop - start; // 禁止修改
+    float test_time = duration.count();  // 禁止修改
+
+    return std::make_tuple(iteration, test_time, resid / init_res);  // 禁止修改
+}

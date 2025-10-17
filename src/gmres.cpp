@@ -1,58 +1,86 @@
-#include <stdio.h>
-#include <assert.h>
-#include <iostream>
+#include "gmres.hpp" // 包含官方头文件
 #include <vector>
-#include <tuple>
 #include <cmath>
-#include <cassert>
 #include <chrono>
-#include "sparseMatrix.hpp"
-#include "gmres.hpp"
+#include <iostream>
 
-using namespace std;
+// CUDA Headers
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cusparse.h>
 
 const int RESTART_TIMES = 20;         // 禁止修改
 const double REL_RESID_LIMIT = 1e-6;  // 禁止修改
 const int ITERATION_LIMIT = 10000;    // 禁止修改
 
-void applyRotation(double &dx, double &dy, double &cs, double &sn) {
+const int H_NUM_ROWS = RESTART_TIMES + 1;
+
+// --- CUDA API Error Checking Macro ---
+#define CUDA_CHECK(err) { \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// --- cuBLAS API Error Checking Macro ---
+#define CUBLAS_CHECK(err) { \
+    if (err != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS Error at %s:%d\n", __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// --- cuSPARSE API Error Checking Macro ---
+#define CUSPARSE_CHECK(err) { \
+    if (err != CUSPARSE_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuSPARSE Error at %s:%d\n", __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+}
+
+// =========================================================================
+// 内部辅助函数，声明为 static，作用域限制在本文件内
+// =========================================================================
+
+static void applyRotation(double &dx, double &dy, double &cs, double &sn) {
     double temp = cs * dx + sn * dy;
     dy = (-sn) * dx + cs * dy;
     dx = temp;
 }
 
-void generateRotation(double &dx, double &dy, double &cs, double &sn) {
-    if (dx == double(0)) {
-        cs = double(0);
-        sn = double(1);
+static void generateRotation(double &dx, double &dy, double &cs, double &sn) {
+    if (dx == 0.0) {
+        cs = 0.0;
+        sn = 1.0;
     } else {
-        double scale = fabs(dx) + fabs(dy);
-        double norm = scale * std::sqrt(fabs(dx / scale) * fabs(dx / scale) +
-                                        fabs(dy / scale) * fabs(dy / scale));
-        double alpha = dx / fabs(dx);
-        cs = fabs(dx) / norm;
+        double scale = std::abs(dx) + std::abs(dy);
+        double norm = scale * std::sqrt((dx / scale) * (dx / scale) + (dy / scale) * (dy / scale));
+        double alpha = dx > 0 ? 1.0 : -1.0;
+        cs = std::abs(dx) / norm;
         sn = alpha * dy / norm;
     }
 }
 
-void rotation2(uint Am, double *H, double *cs, double *sn, double *s, uint i) {
+static void rotation2(uint Am, double *H, double *cs, double *sn, double *s, uint i) {
     for (uint k = 0; k < i; k++) {
-        applyRotation(H[k * Am + i], H[(k + 1) * Am + i], cs[k], sn[k]);
+        applyRotation(H[i * H_NUM_ROWS + k], H[i * H_NUM_ROWS + (k + 1)], cs[k], sn[k]);
     }
-    generateRotation(H[i * Am + i], H[(i + 1) * Am + i], cs[i], sn[i]);
-    applyRotation(H[i * Am + i], H[(i + 1) * Am + i], cs[i], sn[i]);
+    generateRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
     applyRotation(s[i], s[i + 1], cs[i], sn[i]);
 }
 
-double calculateNorm(const double *vec, uint N) {
-    double sum = 0.0;
-    for (uint i = 0; i < N; ++i) {
-        sum += vec[i] * vec[i];
+static void sovlerTri(int Am, int i, double *H, double *s) {
+    for (int j = i; j >= 0; j--) {
+        s[j] /= H[j * H_NUM_ROWS + j];
+        for (int k = j - 1; k >= 0; k--) {
+            s[k] -= H[j * H_NUM_ROWS + k] * s[j];
+        }
     }
-    return std::sqrt(sum);
 }
 
-void spmv(const uint *rowPtr, const uint *colInd, const double *values,
+static void spmv_cpu(const uint *rowPtr, const uint *colInd, const double *values,
           const double *x, double *y, uint numRows) {
     for (uint i = 0; i < numRows; ++i) {
         double sum = 0.0;
@@ -63,91 +91,120 @@ void spmv(const uint *rowPtr, const uint *colInd, const double *values,
     }
 }
 
-double dotProduct(const double *x, const double *y, uint N) {
+static double calculateNorm_cpu(const double *vec, uint N) {
     double sum = 0.0;
     for (uint i = 0; i < N; ++i) {
-        sum += x[i] * y[i];
+        sum += vec[i] * vec[i];
     }
-    return sum;
+    return std::sqrt(sum);
 }
 
-void daxpy(double alpha, const double *x, double *y, uint N) {
-    for (uint i = 0; i < N; ++i) {
-        y[i] += alpha * x[i];
+// =========================================================================
+// gmres.hpp 中声明的函数实现
+// =========================================================================
+
+void initialize(SpM<double> *A, double *x, double *b) {
+    int N = A->nrows;
+    std::vector<double> temp_x(N);
+
+    for (int i = 0; i < N; i++) {
+        temp_x[i] = sin(i);
     }
+
+    double beta = calculateNorm_cpu(temp_x.data(), N);
+    for (uint i = 0; i < N; i++) {
+        temp_x[i] /= beta;
+    }
+
+    spmv_cpu(A->rows, A->cols, A->vals, temp_x.data(), b, N);
+
+    for (uint i = 0; i < N; i++) x[i] = 0.0;
 }
 
-void dscal(double alpha, double *x, uint N) {
-    for (uint i = 0; i < N; ++i) {
-        x[i] *= alpha;
-    }
-}
+RESULT gmres(SpM<double> *A_h, double *x_h, double *b_h) {
+    const uint N = A_h->nrows;
+    const uint NNZ = A_h->nnz;
 
-void dcopy(const double *src, double *dst, uint N) {
-    for (uint i = 0; i < N; ++i) {
-        dst[i] = src[i];
-    }
-}
-
-void sovlerTri(int Am, int i, double *H, double *s) {
-    for (int j = i; j >= 0; j--) {
-        s[j] /= H[Am * j + j];
-        for (int k = j - 1; k >= 0; k--) {
-            s[k] -= H[k * Am + j] * s[j];
-        }
-    }
-}
-
-RESULT gmres(SpM<double> *A_d, double *x_d, double *_b) {
-    // 若要采用其他的稀疏矩阵压缩格式，需从CSR矩阵开始转换，且格式转换的代码必须包含到计时范围内
-    const uint N = A_d->nrows;
-
-    std::vector<double> r0(N);
-    std::vector<double> V((RESTART_TIMES + 1) * N);
     std::vector<double> s(RESTART_TIMES + 1, 0.0);
-    std::vector<double> V0(N);
-    std::vector<double> H((RESTART_TIMES + 1) * RESTART_TIMES);
-    std::vector<double> cs(RESTART_TIMES);
-    std::vector<double> sn(RESTART_TIMES);
-
-    double H_cpu;
-    double beta_cpu;
-
-    double alpha;
-
-    double beta;
-    beta = calculateNorm(_b, N);
-    double RESID_LIMIT = REL_RESID_LIMIT * beta;
-    double init_res = beta;
+    std::vector<double> H(H_NUM_ROWS * RESTART_TIMES, 0.0);
+    std::vector<double> cs(RESTART_TIMES, 0.0);
+    std::vector<double> sn(RESTART_TIMES, 0.0);
+    
+    // 在计时器外声明句柄和设备指针
+   
+    auto start = std::chrono::high_resolution_clock::now();  // 禁止修改
+    cublasHandle_t cublas_handle;
+    cusparseHandle_t cusparse_handle;
+    cusparseSpMatDescr_t matA;
+    void *d_rows, *d_cols, *d_vals;
+    double *x_d, *b_d, *r_d, *V_d;
+    void *d_buffer = nullptr;
+    cusparseDnVecDescr_t vecX_descr, vecR_descr;
 
     int i, j, k;
     double resid;
     int iteration = 0;
+    double init_res;
 
-    auto start = std::chrono::high_resolution_clock::now();  // 禁止修改
+    // --- 初始化代码移入计时器内部 ---
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+    CUSPARSE_CHECK(cusparseCreate(&cusparse_handle));
 
-    // 任何对稀疏矩阵的预处理操作，如稀疏矩阵压缩格式转换、非零元数组或向量的精度转换、稀疏矩阵的非零元特征计算等，均需放在计时范围内，相关内存申请和释放除外
+    CUDA_CHECK(cudaMalloc(&d_rows, (N + 1) * sizeof(uint)));
+    CUDA_CHECK(cudaMalloc(&d_cols, NNZ * sizeof(uint)));
+    CUDA_CHECK(cudaMalloc(&d_vals, NNZ * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_rows, A_h->rows, (N + 1) * sizeof(uint), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_cols, A_h->cols, NNZ * sizeof(uint), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vals, A_h->vals, NNZ * sizeof(double), cudaMemcpyHostToDevice));
 
-    /****GMRES计算过程****/
+    CUSPARSE_CHECK(cusparseCreateCsr(&matA, N, N, NNZ, d_rows, d_cols, d_vals,
+                                    CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                    CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    
+    CUDA_CHECK(cudaMalloc((void **)&x_d, N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&b_d, N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&r_d, N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc((void **)&V_d, (RESTART_TIMES + 1) * N * sizeof(double)));
+    
+    CUDA_CHECK(cudaMemcpy(x_d, x_h, N * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(b_d, b_h, N * sizeof(double), cudaMemcpyHostToDevice));
+    
+    size_t buffer_size = 0;
+    const double gpu_alpha_one = 1.0;
+    const double gpu_beta_zero = 0.0;
+
+    CUSPARSE_CHECK(cusparseCreateDnVec(&vecX_descr, N, x_d, CUDA_R_64F));
+    CUSPARSE_CHECK(cusparseCreateDnVec(&vecR_descr, N, r_d, CUDA_R_64F));
+
+    CUSPARSE_CHECK(cusparseSpMV_bufferSize(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &gpu_alpha_one, matA, vecX_descr, &gpu_beta_zero, vecR_descr, 
+                                           CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &buffer_size));
+    CUDA_CHECK(cudaMalloc(&d_buffer, buffer_size));
+
+    double beta;
+    CUBLAS_CHECK(cublasDnrm2(cublas_handle, N, b_d, 1, &beta));
+    double RESID_LIMIT = REL_RESID_LIMIT * beta;
+    init_res = beta;
+    // --- 初始化结束 ---
+
     do {
-        // ==========外迭代============
-        spmv(A_d->rows, A_d->cols, A_d->vals, x_d, r0.data(),
-             N);  // 不可修改此步操作中相关数据的存储精度和SpMV计算精度
+        CUSPARSE_CHECK(cusparseDnVecSetValues(vecX_descr, x_d));
+        CUSPARSE_CHECK(cusparseSpMV(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                    &gpu_alpha_one, matA, vecX_descr, &gpu_beta_zero, vecR_descr, CUDA_R_64F,
+                                    CUSPARSE_SPMV_ALG_DEFAULT, d_buffer));
+        
+        const double gpu_minus_one = -1.0;
+        CUBLAS_CHECK(cublasDaxpy(cublas_handle, N, &gpu_minus_one, b_d, 1, r_d, 1));
+        
+        CUBLAS_CHECK(cublasDnrm2(cublas_handle, N, r_d, 1, &beta));
+        
+        const double alpha_scal = -1.0 / beta;
+        CUBLAS_CHECK(cublasDscal(cublas_handle, N, &alpha_scal, r_d, 1));
+        
+        CUBLAS_CHECK(cublasDcopy(cublas_handle, N, r_d, 1, V_d, 1));
 
-        alpha = -1.0;
-        daxpy(alpha, _b, r0.data(), N);
-
-        beta = calculateNorm(r0.data(), N);
-
-        alpha = -1.0 / beta;
-        dscal(alpha, r0.data(), N);
-
-        dcopy(r0.data(), V.data(), N);
-
-        // 初始化残差向量
         fill(s.begin(), s.end(), 0.0);
         s[0] = beta;
-
         resid = std::abs(beta);
         i = -1;
 
@@ -155,71 +212,70 @@ RESULT gmres(SpM<double> *A_d, double *x_d, double *_b) {
             break;
         }
         do {
-            // ==========内迭代============
             i++;
             iteration++;
-
-            std::vector<double> V_i(N);
-            dcopy(V.data() + i * N, V_i.data(), N);
-
-            spmv(A_d->rows, A_d->cols, A_d->vals, V_i.data(), r0.data(), N);
+            
+            CUSPARSE_CHECK(cusparseDnVecSetValues(vecX_descr, V_d + i * N));
+            CUSPARSE_CHECK(cusparseSpMV(cusparse_handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &gpu_alpha_one, matA, vecX_descr,
+                                        &gpu_beta_zero, vecR_descr, CUDA_R_64F,
+                                        CUSPARSE_SPMV_ALG_DEFAULT, d_buffer));
 
             for (k = 0; k <= i; k++) {
-                H[k * RESTART_TIMES + i] =
-                    dotProduct(r0.data(), V.data() + k * N, N);
-
-                alpha = -H[k * RESTART_TIMES + i];
-                daxpy(alpha, V.data() + N * k, r0.data(), N);
+                double h_val;
+                CUBLAS_CHECK(cublasDdot(cublas_handle, N, r_d, 1, V_d + k * N, 1, &h_val));
+                H[i * H_NUM_ROWS + k] = h_val;
+                
+                const double alpha_daxpy = -H[i * H_NUM_ROWS + k];
+                CUBLAS_CHECK(cublasDaxpy(cublas_handle, N, &alpha_daxpy, V_d + k * N, 1, r_d, 1));
             }
-            H[(i + 1) * RESTART_TIMES + i] = calculateNorm(r0.data(), N);
+            
+            double h_norm;
+            CUBLAS_CHECK(cublasDnrm2(cublas_handle, N, r_d, 1, &h_norm));
+            H[i * H_NUM_ROWS + (i + 1)] = h_norm;
 
-            alpha = 1.0 / H[(i + 1) * RESTART_TIMES + i];
-            dscal(alpha, r0.data(), N);
-            dcopy(r0.data(), V.data() + N * (i + 1), N);
+            if(h_norm != 0.0) {
+                const double alpha_dscal_2 = 1.0 / h_norm;
+                CUBLAS_CHECK(cublasDscal(cublas_handle, N, &alpha_dscal_2, r_d, 1));
+            }
+            
+            CUBLAS_CHECK(cublasDcopy(cublas_handle, N, r_d, 1, V_d + (i + 1) * N, 1));
 
-            rotation2(RESTART_TIMES, H.data(), cs.data(), sn.data(), s.data(),
-                      i);
+            rotation2(RESTART_TIMES, H.data(), cs.data(), sn.data(), s.data(), i);
 
             resid = std::abs(s[i + 1]);
-            // std::cout << "iteration " << iteration << ", resid = " <<
-            // resid/init_res << std::endl;
 
             if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
                 break;
             }
         } while (i + 1 < RESTART_TIMES && iteration <= ITERATION_LIMIT);
 
-        // 求解上三角系统
         sovlerTri(RESTART_TIMES, i, H.data(), s.data());
 
-        // 更新解
         for (j = 0; j <= i; j++) {
-            daxpy(s[j], V.data() + j * N, x_d, N);
+            CUBLAS_CHECK(cublasDaxpy(cublas_handle, N, &s[j], V_d + j * N, 1, x_d, 1));
         }
     } while (resid > RESID_LIMIT && iteration <= ITERATION_LIMIT);
+    CUDA_CHECK(cudaMemcpy(x_h, x_d, N * sizeof(double), cudaMemcpyDeviceToHost));
 
+    cudaFree(d_buffer);
+    cusparseDestroyDnVec(vecX_descr);
+    cusparseDestroyDnVec(vecR_descr);
+    cusparseDestroySpMat(matA);
+    cudaFree(d_rows);
+    cudaFree(d_cols);
+    cudaFree(d_vals);
+    cudaFree(x_d);
+    cudaFree(b_d);
+    cudaFree(r_d);
+    cudaFree(V_d);
+    cusparseDestroy(cusparse_handle);
+    cublasDestroy(cublas_handle);
     auto stop = std::chrono::high_resolution_clock::now();  // 禁止修改
-    std::chrono::duration<float, std::milli> duration =
-        stop - start;                    // 禁止修改
+    std::chrono::duration<float, std::milli> duration = stop - start; // 禁止修改
     float test_time = duration.count();  // 禁止修改
 
-    return make_tuple(iteration, test_time, resid / init_res);  // 禁止修改
-}
+    
 
-// 此函数不在计时区域内，不得改变精度
-void initialize(SpM<double> *A, double *x, double *b) {
-    int N = A->nrows;
-
-    for (int i = 0; i < N; i++) {
-        x[i] = sin(i);
-    }
-
-    double beta = calculateNorm(x, N);  // 可修改，但不可改变精度
-    for (uint i = 0; i < N; i++) {
-        x[i] /= beta;
-    }
-
-    spmv(A->rows, A->cols, A->vals, x, b, N);  // 可修改，但不可改变精度
-
-    for (uint i = 0; i < N; i++) x[i] = 0.0;
+    return std::make_tuple(iteration, test_time, resid / init_res);  // 禁止修改
 }

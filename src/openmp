@@ -1,0 +1,333 @@
+#include <stdio.h>
+#include <assert.h>
+#include <iostream>
+#include <vector>
+#include <tuple>
+#include <cmath>
+#include <cassert>
+#include <chrono>
+// 使用 Intel Intrinsics 头文件来利用 AVX-512
+#include <immintrin.h>
+// 添加OpenMP支持
+#include <omp.h>
+
+#include "sparseMatrix.hpp"
+#include "gmres.hpp"
+
+using namespace std;
+
+const int RESTART_TIMES = 20;         // 禁止修改
+const double REL_RESID_LIMIT = 1e-6;  // 禁止修改
+const int ITERATION_LIMIT = 10000;    // 禁止修改
+
+// 缓存优化: H 矩阵现在按列主序存储.
+// H[row][col] -> H[col * num_rows + row]
+const int H_NUM_ROWS = RESTART_TIMES + 1;
+
+void applyRotation(double &dx, double &dy, double &cs, double &sn) {
+    double temp = cs * dx + sn * dy;
+    dy = (-sn) * dx + cs * dy;
+    dx = temp;
+}
+
+void generateRotation(double &dx, double &dy, double &cs, double &sn) {
+    if (dx == double(0)) {
+        cs = double(0);
+        sn = double(1);
+    } else {
+        double scale = fabs(dx) + fabs(dy);
+        double norm = scale * std::sqrt(fabs(dx / scale) * fabs(dx / scale) +
+                                        fabs(dy / scale) * fabs(dy / scale));
+        double alpha = dx / fabs(dx);
+        cs = fabs(dx) / norm;
+        sn = alpha * dy / norm;
+    }
+}
+
+void rotation2(uint Am, double *H, double *cs, double *sn, double *s, uint i) {
+    // 缓存优化: H 矩阵按列主序存储
+    for (uint k = 0; k < i; k++) {
+        applyRotation(H[i * H_NUM_ROWS + k], H[i * H_NUM_ROWS + (k + 1)], cs[k], sn[k]);
+    }
+    generateRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(H[i * H_NUM_ROWS + i], H[i * H_NUM_ROWS + (i + 1)], cs[i], sn[i]);
+    applyRotation(s[i], s[i + 1], cs[i], sn[i]);
+}
+
+double calculateNorm(const double *vec, uint N) {
+    // AVX-512 优化 + OpenMP并行化
+    const int stride = 8;
+    double sum = 0.0;
+    
+    #pragma omp parallel reduction(+:sum)
+    {
+        __m512d sum_vec = _mm512_setzero_pd();
+        
+        #pragma omp for nowait
+        for (uint i = 0; i + stride <= N; i += stride) {
+            __m512d v_vec = _mm512_loadu_pd(vec + i);
+            sum_vec = _mm512_fmadd_pd(v_vec, v_vec, sum_vec);
+        }
+        
+        // 每个线程计算自己的部分和
+        double thread_sum = _mm512_reduce_add_pd(sum_vec);
+        sum += thread_sum;
+        
+        // 处理剩余元素
+        #pragma omp for reduction(+:sum)
+        for (uint i = (N / stride) * stride; i < N; ++i) {
+            sum += vec[i] * vec[i];
+        }
+    }
+    
+    return std::sqrt(sum);
+}
+
+void spmv(const uint *rowPtr, const uint *colInd, const double *values,
+          const double *x, double *y, uint numRows) {
+    // OpenMP并行化行处理
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (uint i = 0; i < numRows; ++i) {
+        double sum = 0.0;
+        uint row_start = rowPtr[i];
+        uint row_end = rowPtr[i + 1];
+        
+        // 使用局部变量减少内存访问
+        for (uint j = row_start; j < row_end; ++j) {
+            sum += values[j] * x[colInd[j]];
+        }
+        y[i] = sum;
+    }
+}
+
+double dotProduct(const double *x, const double *y, uint N) {
+    // AVX-512 优化 + OpenMP并行化
+    const int stride = 8;
+    double sum = 0.0;
+    
+    #pragma omp parallel reduction(+:sum)
+    {
+        __m512d sum_vec = _mm512_setzero_pd();
+        
+        #pragma omp for nowait
+        for (uint i = 0; i + stride <= N; i += stride) {
+            __m512d x_vec = _mm512_loadu_pd(x + i);
+            __m512d y_vec = _mm512_loadu_pd(y + i);
+            sum_vec = _mm512_fmadd_pd(x_vec, y_vec, sum_vec);
+        }
+        
+        // 每个线程计算自己的部分和
+        double thread_sum = _mm512_reduce_add_pd(sum_vec);
+        sum += thread_sum;
+        
+        // 处理剩余元素
+        #pragma omp for reduction(+:sum)
+        for (uint i = (N / stride) * stride; i < N; ++i) {
+            sum += x[i] * y[i];
+        }
+    }
+    
+    return sum;
+}
+
+void daxpy(double alpha, const double *x, double *y, uint N) {
+    // AVX-512 优化 + OpenMP并行化
+    const int stride = 8;
+    __m512d alpha_vec = _mm512_set1_pd(alpha);
+    
+    #pragma omp parallel
+    {
+        #pragma omp for nowait
+        for (uint i = 0; i + stride <= N; i += stride) {
+            __m512d x_vec = _mm512_loadu_pd(x + i);
+            __m512d y_vec = _mm512_loadu_pd(y + i);
+            y_vec = _mm512_fmadd_pd(alpha_vec, x_vec, y_vec);
+            _mm512_storeu_pd(y + i, y_vec);
+        }
+        
+        // 处理剩余元素
+        #pragma omp for
+        for (uint i = (N / stride) * stride; i < N; ++i) {
+            y[i] += alpha * x[i];
+        }
+    }
+}
+
+void dscal(double alpha, double *x, uint N) {
+    // AVX-512 优化 + OpenMP并行化
+    const int stride = 8;
+    __m512d alpha_vec = _mm512_set1_pd(alpha);
+    
+    #pragma omp parallel
+    {
+        #pragma omp for nowait
+        for (uint i = 0; i + stride <= N; i += stride) {
+            __m512d x_vec = _mm512_loadu_pd(x + i);
+            x_vec = _mm512_mul_pd(alpha_vec, x_vec);
+            _mm512_storeu_pd(x + i, x_vec);
+        }
+        
+        // 处理剩余元素
+        #pragma omp for
+        for (uint i = (N / stride) * stride; i < N; ++i) {
+            x[i] *= alpha;
+        }
+    }
+}
+
+void dcopy(const double *src, double *dst, uint N) {
+    // AVX-512 优化 + OpenMP并行化
+    const int stride = 8;
+    
+    #pragma omp parallel
+    {
+        #pragma omp for nowait
+        for (uint i = 0; i + stride <= N; i += stride) {
+            __m512d src_vec = _mm512_loadu_pd(src + i);
+            _mm512_storeu_pd(dst + i, src_vec);
+        }
+        
+        // 处理剩余元素
+        #pragma omp for
+        for (uint i = (N / stride) * stride; i < N; ++i) {
+            dst[i] = src[i];
+        }
+    }
+}
+
+void sovlerTri(int Am, int i, double *H, double *s) {
+    // 缓存优化: H 矩阵按列主序存储
+    // 这个函数是顺序的，不适合并行化
+    for (int j = i; j >= 0; j--) {
+        s[j] /= H[j * H_NUM_ROWS + j];
+        for (int k = j - 1; k >= 0; k--) {
+            s[k] -= H[j * H_NUM_ROWS + k] * s[j];
+        }
+    }
+}
+
+RESULT gmres(SpM<double> *A_d, double *x_d, double *_b) {
+    const uint N = A_d->nrows;
+
+    // 设置OpenMP线程数（可选，默认使用系统所有核心）
+    // omp_set_num_threads(omp_get_max_threads());
+
+    std::vector<double> r0(N);
+    std::vector<double> V((RESTART_TIMES + 1) * N);
+    std::vector<double> s(RESTART_TIMES + 1, 0.0);
+    std::vector<double> H(H_NUM_ROWS * RESTART_TIMES);
+    std::vector<double> cs(RESTART_TIMES);
+    std::vector<double> sn(RESTART_TIMES);
+
+    double alpha;
+    double beta;
+    beta = calculateNorm(_b, N);
+    double RESID_LIMIT = REL_RESID_LIMIT * beta;
+    double init_res = beta;
+
+    int i, j, k;
+    double resid;
+    int iteration = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();  // 禁止修改
+
+    /****GMRES求解循环主体****/
+    do {
+        // ==========外层循环============
+        spmv(A_d->rows, A_d->cols, A_d->vals, x_d, r0.data(), N);
+
+        alpha = -1.0;
+        daxpy(alpha, _b, r0.data(), N);
+
+        beta = calculateNorm(r0.data(), N);
+
+        alpha = -1.0 / beta;
+        dscal(alpha, r0.data(), N);
+
+        dcopy(r0.data(), V.data(), N);
+
+        // 重置除了第一个元素外的所有元素
+        #pragma omp parallel for
+        for (size_t idx = 0; idx < s.size(); ++idx) {
+            s[idx] = 0.0;
+        }
+        s[0] = beta;
+
+        resid = std::abs(beta);
+        i = -1;
+
+        if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+            break;
+        }
+        
+        do {
+            // ==========内层循环============
+            i++;
+            iteration++;
+            
+            spmv(A_d->rows, A_d->cols, A_d->vals, V.data() + i * N, r0.data(), N);
+
+            // Arnoldi过程 - 内层循环需要顺序执行
+            for (k = 0; k <= i; k++) {
+                H[i * H_NUM_ROWS + k] = dotProduct(r0.data(), V.data() + k * N, N);
+
+                alpha = -H[i * H_NUM_ROWS + k];
+                daxpy(alpha, V.data() + k * N, r0.data(), N);
+            }
+            
+            H[i * H_NUM_ROWS + (i + 1)] = calculateNorm(r0.data(), N);
+
+            alpha = 1.0 / H[i * H_NUM_ROWS + (i + 1)];
+            dscal(alpha, r0.data(), N);
+            dcopy(r0.data(), V.data() + (i + 1) * N, N);
+
+            rotation2(RESTART_TIMES, H.data(), cs.data(), sn.data(), s.data(), i);
+
+            resid = std::abs(s[i + 1]);
+
+            if (resid <= RESID_LIMIT || iteration >= ITERATION_LIMIT) {
+                break;
+            }
+        } while (i + 1 < RESTART_TIMES && iteration <= ITERATION_LIMIT);
+
+        // 解三角系统更新解系数
+        sovlerTri(RESTART_TIMES, i, H.data(), s.data());
+
+        // 更新最终解
+        for (j = 0; j <= i; j++) {
+            daxpy(s[j], V.data() + j * N, x_d, N);
+        }
+    } while (resid > RESID_LIMIT && iteration <= ITERATION_LIMIT);
+
+    auto stop = std::chrono::high_resolution_clock::now();  // 禁止修改
+    std::chrono::duration<float, std::milli> duration = stop - start; // 禁止修改
+    float test_time = duration.count();  // 禁止修改
+
+    return make_tuple(iteration, test_time, resid / init_res);  // 禁止修改
+}
+
+void initialize(SpM<double> *A, double *x, double *b) {
+    int N = A->nrows;
+
+    // OpenMP并行化初始化
+    #pragma omp parallel for
+    for (int i = 0; i < N; i++) {
+        x[i] = sin(i);
+    }
+
+    double beta = calculateNorm(x, N);
+    
+    // 并行归一化
+    #pragma omp parallel for
+    for (uint i = 0; i < N; i++) {
+        x[i] /= beta;
+    }
+
+    spmv(A->rows, A->cols, A->vals, x, b, N);
+
+    // 并行重置x为0
+    #pragma omp parallel for
+    for (uint i = 0; i < N; i++) {
+        x[i] = 0.0;
+    }
+}
